@@ -1,19 +1,20 @@
-from abc import ABC, abstractmethod
-import urllib3
-from urllib.parse import urlsplit
-import hashlib
 import base64
+import enum
+import hashlib
 import os
+import shutil
+from abc import ABC, abstractmethod
 from datetime import datetime as dt
 from pathlib import Path
-import enum
-import shutil
+from urllib.parse import urlsplit
+
+import urllib3
 
 from wis2downloader import stop_event
 from wis2downloader.log import LOGGER
-from wis2downloader.queue import BaseQueue
 from wis2downloader.metrics import (DOWNLOADED_BYTES, DOWNLOADED_FILES,
                                     FAILED_DOWNLOADS)
+from wis2downloader.wis_queue import BaseQueue
 
 
 class BaseDownloader(ABC):
@@ -21,41 +22,34 @@ class BaseDownloader(ABC):
     @abstractmethod
     def start(self):
         """Start the download worker to
-        process messages from the queue indefinitely"""
-        pass
+        process messages from the wis_queue indefinitely"""
 
     @abstractmethod
     def process_job(self, job):
-        """Process a single job from the queue"""
-        pass
+        """Process a single job from the wis_queue"""
 
     @abstractmethod
     def get_topic_and_centre(self, job):
         """Extract the topic and centre id from the job"""
-        pass
 
     @abstractmethod
     def get_hash_info(self, job):
         """Extract the hash value and function from the job
         to be used for verification later"""
-        pass
 
     @abstractmethod
     def get_download_url(self, job):
         """Extract the download url, update status, and
         file type from the job links"""
-        pass
 
     @abstractmethod
     def extract_filename(self, _url):
         """Extract the filename and extension from the download link"""
-        pass
 
     @abstractmethod
     def validate_data(self, data, expected_hash, hash_function, expected_size):
         """Validate the hash and size of the downloaded data against
         the expected values"""
-        pass
 
     @abstractmethod
     def save_file(self, data, target, filename, filesize, download_start):
@@ -108,7 +102,7 @@ class DownloadWorker(BaseDownloader):
     def start(self) -> None:
         LOGGER.info("Starting download worker")
         while not stop_event.is_set():
-            # First get the job from the queue
+            # First get the job from the wis_queue
             job = self.queue.dequeue()
             if job.get('shutdown', False):
                 break
@@ -123,7 +117,7 @@ class DownloadWorker(BaseDownloader):
             self.queue.task_done()
 
     def get_free_space(self):
-        total, used, free = shutil.disk_usage(self.basepath)
+        _, _, free = shutil.disk_usage(self.basepath)
         return free
 
     def process_job(self, job) -> None:
@@ -141,7 +135,7 @@ class DownloadWorker(BaseDownloader):
         _url, update, media_type = self.get_download_url(job)
 
         if _url is None:
-            LOGGER.warning(f"No download link found in job {job}")
+            LOGGER.warning("No download link found in job %s", job)
             return
 
         # map media type to file extension
@@ -149,43 +143,39 @@ class DownloadWorker(BaseDownloader):
 
         # Global caches can set whatever filename they want, we need to use
         # the data_id for uniqueness. However, this can be unwieldy, hence use
-        # hash of data_id
+        # the hash of data_id
+        # TODO use data_id to store on Minio S3
         data_id = job.get('payload', {}).get('properties', {}).get('data_id')
         filename, _ = self.extract_filename(_url)
-        filename = filename + '.' + file_type
+        filename = f"{filename}.{file_type}"
+        # TODO remove this (already handled)
+        #     ---------------
+        #
         target = output_dir / filename
         # Create parent dir if it doesn't exist
         target.parent.mkdir(parents=True, exist_ok=True)
-
         # Only download if file doesn't exist or is an update
-        is_duplicate = target.is_file() and not update
-        if is_duplicate:
-            LOGGER.info(f"Skipping download of {filename}, already exists")
+        if target.is_file() and not update:
+            LOGGER.info("Skipping download of %s, already exists", filename)
             return
+        # TODO ---------------
 
         # Get information needed for download metric labels
         topic, centre_id = self.get_topic_and_centre(job)
 
         # Standardise the file type label, defaulting to 'other'
-        all_type_labels = ['bufr', 'grib', 'json', 'xml', 'png']
-        file_type_label = 'other'
-
-        for label in all_type_labels:
-            if label in file_type:
-                file_type_label = label
-                break
+        file_type_label = file_type if file_type in ['bufr', 'grib', 'json', 'xml', 'png'] else 'other'
 
         # Start timer of download time to be logged later
         download_start = dt.now()
 
         # Download the file
-        response = None
         try:
             response = self.http.request('GET', _url)
-            # Get the filesize in KB
+            # Get the file size in KB
             filesize = len(response.data)
         except Exception as e:
-            LOGGER.error(f"Error downloading {_url}")
+            LOGGER.error("Error downloading %s", _url)
             LOGGER.error(e)
             # Increment failed download counter
             FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
@@ -194,7 +184,8 @@ class DownloadWorker(BaseDownloader):
         if self.min_free_space > 0:  # only check size if limit set
             free_space = self.get_free_space()
             if free_space < self.min_free_space:
-                LOGGER.warning(f"Too little free space, {free_space - filesize} < {self.min_free_space} , file {data_id} not saved")  # noqa
+                LOGGER.warning("Too little free space, %d < %d, file %s not saved",
+                               free_space - filesize, self.min_free_space, data_id)
                 FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
                 return
 
@@ -203,41 +194,31 @@ class DownloadWorker(BaseDownloader):
             return
 
         # Use the hash function to determine whether to save the data
-        save_data = self.validate_data(
-            response.data, expected_hash, hash_function, expected_size)
-
-        if not save_data:
-            LOGGER.warning(f"Download {data_id} failed verification, discarding")  # noqa
+        if not self.validate_data(response.data, expected_hash, hash_function, expected_size):
+            LOGGER.warning("Download %s failed verification, discarding", data_id)  # noqa
             # Increment failed download counter
             FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
             return
 
         # Now save
-        self.save_file(response.data, target, filename,
-                       filesize, download_start)
+        self.save_file(response.data, target, filename, filesize, download_start)
 
         # Increment metrics
-        DOWNLOADED_BYTES.labels(
-            topic=topic, centre_id=centre_id,
-            file_type=file_type_label).inc(filesize)
-        DOWNLOADED_FILES.labels(
-            topic=topic, centre_id=centre_id,
-            file_type=file_type_label).inc(1)
+        DOWNLOADED_BYTES.labels(topic=topic, centre_id=centre_id, file_type=file_type_label).inc(filesize)
+        DOWNLOADED_FILES.labels(topic=topic, centre_id=centre_id, file_type=file_type_label).inc(1)
 
     def get_topic_and_centre(self, job) -> tuple:
         topic = job.get('topic')
         return topic, topic.split('/')[3]
 
     def get_hash_info(self, job):
-        expected_hash = job.get('payload', {}).get(
-            'properties', {}).get('integrity', {}).get('hash')
-        hash_method = job.get('payload', {}).get(
-            'properties', {}).get('integrity', {}).get('method')
+        expected_hash = job.get('payload', {}).get('properties', {}).get('integrity', {}).get('hash')
+        hash_method = job.get('payload', {}).get('properties', {}).get('integrity', {}).get('method')
 
         hash_function = None
 
-        # Check if hash method is known using our enumumeration of hash methods
-        if hash_method in VerificationMethods._member_names_:
+        # Check if hash method is known using our enumeration of hash methods
+        if hash_method in VerificationMethods.__members__:
             method = VerificationMethods[hash_method].value
             hash_function = hashlib.new(method)
 
@@ -245,18 +226,13 @@ class DownloadWorker(BaseDownloader):
 
     def get_download_url(self, job) -> tuple:
         links = job.get('payload', {}).get('links', [])
-        _url = None
-        update = False
-        media_type = None
+        _url, update, media_type = None, False, None
         for link in links:
             if link.get('rel') == 'update':
-                _url = link.get('href')
-                media_type = link.get('type')
-                update = True
+                _url, media_type, update = link.get('href'), link.get('type'), True
                 break
             elif link.get('rel') == 'canonical':
-                _url = link.get('href')
-                media_type = link.get('type')
+                _url, media_type = link.get('href'), link.get('type')
                 break
 
         return _url, update, media_type
@@ -264,31 +240,20 @@ class DownloadWorker(BaseDownloader):
     def extract_filename(self, _url) -> tuple:
         path = urlsplit(_url).path
         filename = os.path.basename(path)
-        filename, filename_ext = os.path.splitext(filename)
-        return filename, filename_ext
+        return os.path.splitext(filename)
 
-    def validate_data(self, data, expected_hash,
-                      hash_function, expected_size) -> bool:
-        if None in (expected_hash, hash_function,
-                    hash_function):
+    def validate_data(self, data, expected_hash, hash_function, expected_size) -> bool:
+        if None in (expected_hash, hash_function):
             return True
 
-        hash_value = hash_function(data).digest()
-        hash_value = base64.b64encode(hash_value).decode()
-        if (hash_value != expected_hash) or (len(data) != expected_size):
-            return False
+        hash_value = base64.b64encode(hash_function(data).digest()).decode()
+        return hash_value == expected_hash and len(data) == expected_size
 
-        return True
-
-    def save_file(self, data, target, filename, filesize,
-                  download_start) -> None:
+    def save_file(self, data, target, filename, filesize, download_start) -> None:
         try:
             target.write_bytes(data)
-            download_end = dt.now()
-            download_time = download_end - download_start
-            download_seconds = round(download_time.total_seconds(), 2)
-            LOGGER.info(
-                f"Downloaded {filename} of size {filesize} bytes in {download_seconds} seconds")  # noqa
+            download_time = (dt.now() - download_start).total_seconds()
+            LOGGER.info("Downloaded %s of size %d bytes in %.2f seconds", filename, filesize, download_time)
         except Exception as e:
-            LOGGER.error(f"Error saving to disk: {target}")
+            LOGGER.error("Error saving to disk: %s", target)
             LOGGER.error(e)

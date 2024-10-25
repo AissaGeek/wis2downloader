@@ -1,6 +1,6 @@
+import time
 from abc import ABC, abstractmethod
 from queue import Queue
-import time
 
 from wis2downloader import stop_event
 from wis2downloader.log import LOGGER

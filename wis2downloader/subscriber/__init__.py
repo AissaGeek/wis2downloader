@@ -9,7 +9,7 @@ import paho.mqtt.client as mqtt
 
 from wis2downloader import stop_event
 from wis2downloader.log import LOGGER
-from wis2downloader.queue import BaseQueue
+from wis2downloader.wis_queue import BaseQueue
 from wis2downloader.metrics import TOPIC_STATUS
 
 
