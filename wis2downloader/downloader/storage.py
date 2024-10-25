@@ -5,22 +5,29 @@ implementation for S3 storage.
 
 from abc import abstractmethod, ABC
 from pathlib import Path
+import shutil
 from typing import BinaryIO
+from datetime import datetime as dt
 
 import minio
 
 from wis2downloader.log import LOGGER
+
+__all__ = ['S3', 'FS']
+
+
+def get_date_now() -> str:
+    """
+    Returns today's date in the format yyyy/mm/dd.
+    """
+    today = dt.now()
+    return f'{today.strftime("%Y")} / {today.strftime("%m")} / {today.strftime("%d")}'
 
 
 class Storage(ABC):
     """
     Abstract base class for storage implementations.
     """
-
-    # @abstractmethod
-    def __init__(self, defs, **kwargs):
-        self.type = defs.get('type')
-        self.options = defs.get('options')
 
     @abstractmethod
     def exists(self, filename: Path) -> bool:
@@ -33,14 +40,12 @@ class Storage(ABC):
         """
 
     @abstractmethod
-    def save(self, data: bytes, filename: Path) -> bool:
+    def save(self, data: bytes, filename: Path, filesize: int) -> bool:
         """
         Save data to storage
 
         :param data: `bytes` of data
         :param filename: `str` of filename
-        :param content_type: media type (default is `application/octet-stream`)
-
         :returns: `bool` of save result
         """
 
@@ -70,10 +75,9 @@ class S3(Storage):
     Provides methods to interact with S3 for storage operations.
     """
 
-    def __init__(self, defs, **kwargs):
-        super().__init__(defs, **kwargs)
-        self._s3_bucket = self.options['bucket']
-        self._client = minio.Minio(endpoint=self.options['url'], **kwargs)
+    def __init__(self, **kwargs):
+        self._s3_bucket = kwargs.pop('bucket')
+        self._client = minio.Minio(**kwargs)
 
     @true_or_false
     def exists(self, filename: Path) -> bool:
@@ -98,27 +102,34 @@ class S3(Storage):
         return True
 
 
-class FileSystem(Storage):
+class FS(Storage):
     """
     TODO handle exceptions
     Concrete implementation of the Storage class for a local file system.
     Provides methods to interact with the file system for storage operations.
     """
+    min_free_space: int = 10  # GBytes
 
-    def __init__(self, defs):
-        super().__init__(defs)
-        self._base_path = Path(self.options['base_path'])
+    def __init__(self, **kwargs):
+        self._base_path = Path(kwargs['basedir']) / get_date_now()
+        self.min_free_space = self.min_free_space * (1024 ** 3)  # GBytes to Bytes
 
     def exists(self, filename: Path) -> bool:
         return filename.exists()
 
-    def save(self, data: BinaryIO, filename: Path) -> bool:
+    def save(self, data: BinaryIO, filename: Path, filesize: int) -> bool:
         try:
             file_path = self._base_path / filename
             file_path.parent.mkdir(parents=True, exist_ok=True)
             if self.exists(file_path):
                 LOGGER.warning('File already exists: %s', file_path)
                 return False
+            if self.min_free_space > 0:
+                free_space = self.get_free_space()
+                if free_space < self.min_free_space:
+                    LOGGER.warning("Too little free space, %d < %d, file %s not saved",
+                                   free_space - filesize, self.min_free_space, filename)
+                    return False
             with open(file_path, 'wb') as file:
                 file.write(data.read())
             LOGGER.info('Data saved to %s', file_path)
@@ -126,3 +137,12 @@ class FileSystem(Storage):
         except Exception as err:
             LOGGER.error("Error saving file: %s", err)
             return False
+
+    def get_free_space(self):
+        """
+        Get the free disk space available at the base path.
+
+        :returns: Free space in bytes.
+        """
+        _, _, free = shutil.disk_usage(self._base_path)
+        return free
