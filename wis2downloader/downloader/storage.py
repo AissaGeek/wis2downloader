@@ -3,13 +3,15 @@ This module provides an abstract base class for storage and a concrete
 implementation for S3 storage.
 """
 
-from abc import abstractmethod, ABC
-from pathlib import Path
+import io
 import shutil
-from typing import BinaryIO
+from abc import abstractmethod, ABC
 from datetime import datetime as dt
+from pathlib import Path
 
 import minio
+from urllib3 import PoolManager
+from urllib3.exceptions import HTTPError
 
 from wis2downloader.log import LOGGER
 
@@ -21,7 +23,7 @@ def get_date_now() -> str:
     Returns today's date in the format yyyy/mm/dd.
     """
     today = dt.now()
-    return f'{today.strftime("%Y")} / {today.strftime("%m")} / {today.strftime("%d")}'
+    return f'{today.strftime("%Y")}/{today.strftime("%m")}/{today.strftime("%d")}'
 
 
 class Storage(ABC):
@@ -40,86 +42,128 @@ class Storage(ABC):
         """
 
     @abstractmethod
-    def save(self, data: bytes, filename: Path, filesize: int) -> bool:
+    def save(self, data, filename, filesize, content_type) -> bool:
         """
         Save data to storage
-
         :param data: `bytes` of data
         :param filename: `str` of filename
+        :param filesize: `int` of filesize (default is -1)
+        :param content_type: `str` of content type (default is `application/octet-stream`)
+
         :returns: `bool` of save result
         """
 
 
-def true_or_false(func):
-    """
-    Decorator that wraps a function to handle exceptions from minio.
-    Logs errors and returns False if an S3Error is raised.
-    """
-
-    def wrapper(*args, **kwargs):
-        try:
-            return func(*args, **kwargs)
-        except minio.error.S3Error as err:
-            LOGGER.error("S3 error: %s", err)
-            return False
-        except Exception as err:
-            LOGGER.error("Unexpected error: %s", err)
-            return False
-
-    return wrapper
-
+# def _metric_save(func):
+#     """
+#     Decorator to increment metrics for successful saves
+#     """
+#     def decorator(*args, **kwargs):
+#         def wrapper(target):
+#             result = func(*args, **kwargs)
+#             if result:
+#                 DOWNLOADED_FILES.labels(target=args[0].target, topic=args[0].topic, centre_id=args[0].centre_id, file_type=args[0].file_type).inc(1)
+#                 DOWNLOADED_BYTES.labels(target=args[0].target, topic=args[0].topic, centre_id=args[0].centre_id, file_type=args[0].file_type).inc(args[1])
+#             return result
+#     return wrapper
 
 class S3(Storage):
     """
     Concrete implementation of the Storage class for AWS S3.
     Provides methods to interact with S3 for storage operations.
     """
+    __name__ = 'S3'
+    _instance = None
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super(S3, cls).__new__(cls)
+        return cls._instance
 
     def __init__(self, **kwargs):
-        self._s3_bucket = kwargs.pop('bucket')
-        self._client = minio.Minio(**kwargs)
+        if not hasattr(self, '_initialized'):
+            self._s3_bucket = kwargs.pop('bucket')
+            http_client = PoolManager(
+                retries=0,
+                timeout=5
+            )
+            self._client = minio.Minio(**kwargs, http_client=http_client, secure=False)
+            self._initialized = True
+            self._s3_path = ""
 
-    @true_or_false
-    def exists(self, filename: Path) -> bool:
+    @property
+    def s3_path(self) -> str:
+        return self._s3_path
+
+    @s3_path.setter
+    def s3_path(self, path: str):
+        self._s3_path += path.strip()
+
+    def exists(self, filename: str) -> bool:
         self._client.stat_object(self._s3_bucket, str(filename))
         return True
 
-    @true_or_false
-    def save(self, data: BinaryIO, filename: Path,
-             content_type: str = 'application/octet-stream') -> bool:
-        if self.exists(filename):
-            LOGGER.warning('Object already exists: %s', filename)
+    def save(self, data: bytes, filename: str,
+             _: int = -1, content_type: str = 'application/octet-stream') -> bool:
+        try:
+            if self.exists(filename):
+                LOGGER.warning('Object already exists: %s', filename)
+                return False
+            self._client.put_object(
+                self._s3_bucket,
+                str(filename),
+                io.BytesIO(data),
+                length=-1,
+                part_size=10 * 1024 * 1024,
+                content_type=content_type
+            )
+            LOGGER.info('Data saved to %s', filename)
+            return True
+        except minio.error.S3Error as err:
+            LOGGER.error("Error saving file: %s", err)
             return False
-        self._client.put_object(
-            self._s3_bucket,
-            str(filename),
-            data,
-            length=-1,
-            part_size=10 * 1024 * 1024,
-            content_type=content_type
-        )
-        LOGGER.info('Data saved to %s', filename)
-        return True
+        except HTTPError as err:
+            LOGGER.error("Error saving file: %s", err)
+            return False
 
 
 class FS(Storage):
     """
-    TODO handle exceptions
     Concrete implementation of the Storage class for a local file system.
     Provides methods to interact with the file system for storage operations.
     """
+    __name__ = 'FS'
+    _instance = None
     min_free_space: int = 10  # GBytes
 
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super(FS, cls).__new__(cls)
+        return cls._instance
+
     def __init__(self, **kwargs):
-        self._base_path = Path(kwargs['basedir']) / get_date_now()
-        self.min_free_space = self.min_free_space * (1024 ** 3)  # GBytes to Bytes
+        if not hasattr(self, '_initialized'):
+            self._original_path: str = kwargs['basedir'].strip()
+            self.min_free_space = self.min_free_space * (1024 ** 3)  # GBytes to Bytes
+            self._initialized = True
+            self._base_path = ""
+
+    @property
+    def base_path(self) -> str:
+        return self._base_path
+
+    @base_path.setter
+    def base_path(self, path: str):
+        self._base_path = self._original_path
+        self._base_path += f"/{get_date_now()}/{path.strip()}"
 
     def exists(self, filename: Path) -> bool:
         return filename.exists()
 
-    def save(self, data: BinaryIO, filename: Path, filesize: int) -> bool:
+    def save(self, data: bytes, filename: str, filesize: int = -1, _: str = '') -> bool:
+        # TODO CONFIG['min_free_space']
         try:
-            file_path = self._base_path / filename
+            file_path = Path(self._base_path) / filename
             file_path.parent.mkdir(parents=True, exist_ok=True)
             if self.exists(file_path):
                 LOGGER.warning('File already exists: %s', file_path)
@@ -131,10 +175,10 @@ class FS(Storage):
                                    free_space - filesize, self.min_free_space, filename)
                     return False
             with open(file_path, 'wb') as file:
-                file.write(data.read())
+                file.write(data)
             LOGGER.info('Data saved to %s', file_path)
             return True
-        except Exception as err:
+        except (OSError, IOError) as err:
             LOGGER.error("Error saving file: %s", err)
             return False
 

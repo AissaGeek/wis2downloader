@@ -7,19 +7,17 @@ import base64
 import enum
 import hashlib
 import os
-import shutil
 from abc import ABC, abstractmethod
 from datetime import datetime as dt
-from pathlib import Path
+from typing import List
 from urllib.parse import urlsplit
 
 import urllib3
 
-from wis2downloader import stop_event
 import wis2downloader.downloader.storage as storage
+from wis2downloader import stop_event
 from wis2downloader.log import LOGGER
-from wis2downloader.metrics import (DOWNLOADED_BYTES, DOWNLOADED_FILES,
-                                    FAILED_DOWNLOADS)
+from wis2downloader.metrics import (FAILED_DOWNLOADS_BROKER, DOWNLOADED_BYTES, DOWNLOADED_FILES, FAILED_DOWNLOADS)
 from wis2downloader.wis_queue import BaseQueue
 
 MEDIA_TYPE_MAP = {
@@ -75,7 +73,7 @@ class BaseDownloader(ABC):
         """
 
     @abstractmethod
-    def validate_data(self, data, expected_hash, hash_function, expected_size):
+    def validate_data(self, data, expected_hash, hash_function, expected_size, **kwargs):
         """
         Validate the hash and size of the downloaded data against the expected values.
         """
@@ -105,7 +103,8 @@ class DownloadWorker(BaseDownloader):
     """
     __DOWNLOAD_OPTIONS = ['fs', 's3']
 
-    def __init__(self, queue: BaseQueue,
+    def __init__(self,
+                 queue: BaseQueue,
                  download_options: dict):
         """
         Initialize the DownloadWorker.
@@ -126,11 +125,10 @@ class DownloadWorker(BaseDownloader):
         :param options: The download options to validate.
         :raises ValueError: If any required option is missing or invalid.
         """
-        d_ops = []
+        d_ops: List[storage.Storage] = []
         for key in self.__DOWNLOAD_OPTIONS:
             if key not in options:
                 raise ValueError(f"Missing required download option: {key}")
-            # FIXME move this to process method
             d_ops.append(getattr(storage, key.upper())(**options[key]))
 
         return d_ops
@@ -181,17 +179,12 @@ class DownloadWorker(BaseDownloader):
         data_id = job.get('payload', {}).get('properties', {}).get('data_id')
         filename, _ = self.extract_filename(_url)
         filename = f"{filename}.{file_type}"
-        # TODO remove this (already handled)
-        #     ---------------
-        #
-        output_dir = self.basepath / yyyy / mm / dd / job.get("target", ".")
-        # Create parent dir if it doesn't exist
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # Only download if file doesn't exist or is an update
-        if target.is_file() and not update:
-            LOGGER.info("Skipping download of %s, already exists", filename)
-            return
-        # TODO ---------------
+        # loop through storage adapters to assign full download location
+        for storage_obj in self.download_options:
+            if hasattr(storage_obj, "base_path"):
+                storage_obj.base_path = job.get("target", ".")
+            elif hasattr(storage_obj, "s3_path"):
+                storage_obj.s3_path = data_id
 
         # Get information needed for download metric labels
         topic, centre_id = self.get_topic_and_centre(job)
@@ -204,38 +197,48 @@ class DownloadWorker(BaseDownloader):
             response = self.http.request('GET', _url)
             # Get the file size in KB
             filesize = len(response.data)
+            # Use the hash function to determine whether to save the data
+            if not response or not self.validate_data(response.data,
+                                                      expected_hash,
+                                                      hash_function,
+                                                      expected_size,
+                                                      data_id=data_id):
+                FAILED_DOWNLOADS_BROKER.labels(topic=topic, centre_id=centre_id).inc(1)
+                return
         except Exception as e:
             LOGGER.error("Error downloading %s", _url)
             LOGGER.error(e)
             # Increment failed download counter
-            FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
+            FAILED_DOWNLOADS_BROKER.labels(topic=topic, centre_id=centre_id).inc(1)
             return
 
-        if response is None:
-            FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
-            return
+        file_type_label = file_type if file_type in ['bufr', 'grib', 'json', 'xml', 'png'] else 'other'
+        # Save using Multiple storage adapters
+        for storage_obj in self.download_options:
+            result = storage_obj.save(
+                response.data,
+                filename,
+                filesize,
+                "application/octet-stream")
+            if result:
+                DOWNLOADED_BYTES.labels(
+                    target=storage_obj.__name__,
+                    topic=topic,
+                    centre_id=centre_id,
+                    file_type=file_type_label).inc(filesize)
+                DOWNLOADED_FILES.labels(
+                    target=storage_obj.__name__,
+                    topic=topic,
+                    centre_id=centre_id,
+                    file_type=file_type_label).inc(1)
+            else:
+                FAILED_DOWNLOADS.labels(
+                    target=storage_obj.__name__,
+                    topic=topic,
+                    centre_id=centre_id).inc(1)
 
-        # TODO refactor this with storage.save
-        if self.min_free_space > 0:
-            if True:
-                FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
-                return
-
-        # Use the hash function to determine whether to save the data
-        if not self.validate_data(response.data, expected_hash, hash_function, expected_size):
-            LOGGER.warning("Download %s failed verification, discarding", data_id)
-            FAILED_DOWNLOADS.labels(topic=topic, centre_id=centre_id).inc(1)
-            return
-
-        # Now save
-        self.save_file(response.data, target, filename, filesize)
         download_time = (dt.now() - download_start).total_seconds()
         LOGGER.info("Downloaded %s of size %d bytes in %.2f seconds", filename, filesize, download_time)
-        # Standardise the file type label, defaulting to 'other'
-        file_type_label = file_type if file_type in ['bufr', 'grib', 'json', 'xml', 'png'] else 'other'
-        # Increment metrics
-        DOWNLOADED_BYTES.labels(topic=topic, centre_id=centre_id, file_type=file_type_label).inc(filesize)
-        DOWNLOADED_FILES.labels(topic=topic, centre_id=centre_id, file_type=file_type_label).inc(1)
 
     def get_topic_and_centre(self, job) -> tuple:
         """
@@ -296,7 +299,13 @@ class DownloadWorker(BaseDownloader):
         filename = os.path.basename(path)
         return os.path.splitext(filename)
 
-    def validate_data(self, data, expected_hash, hash_function, expected_size) -> bool:
+    def validate_data(
+            self,
+            data,
+            expected_hash,
+            hash_function,
+            expected_size,
+            **kwargs) -> bool:
         """
         Validate the hash and size of the downloaded data against the expected values.
 
@@ -308,9 +317,11 @@ class DownloadWorker(BaseDownloader):
         """
         if None in (expected_hash, hash_function):
             return True
-
         hash_value = base64.b64encode(hash_function(data).digest()).decode()
-        return hash_value == expected_hash and len(data) == expected_size
+        if not (hash_value == expected_hash and len(data) == expected_size):
+            LOGGER.warning("Download %s failed verification, discarding", kwargs.get("data_id"))
+            return False
+        return True
 
     def save_file(self, data, target, filename, filesize) -> None:
         """
