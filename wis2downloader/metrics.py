@@ -16,5 +16,5 @@ FAILED_DOWNLOADS = Counter(
     'failed_downloads', 'Total number of failed downloads to either fs o s3',
     ['target', 'topic', 'centre_id'])
 FAILED_DOWNLOADS_BROKER = Counter(
-    'failed_downloads', 'Total number of failed downloads from broker ',
+    'failed_downloads_broker', 'Total number of failed downloads from broker ',
     ['topic', 'centre_id'])

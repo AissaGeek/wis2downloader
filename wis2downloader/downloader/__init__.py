@@ -9,7 +9,6 @@ import hashlib
 import os
 from abc import ABC, abstractmethod
 from datetime import datetime as dt
-from typing import List
 from urllib.parse import urlsplit
 
 import urllib3
@@ -67,21 +66,15 @@ class BaseDownloader(ABC):
         """
 
     @abstractmethod
-    def extract_filename(self, _url):
+    def extract_file_name(self, _url):
         """
-        Extract the filename and extension from the download link.
+        Extract the file_name and extension from the download link.
         """
 
     @abstractmethod
     def validate_data(self, data, expected_hash, hash_function, expected_size, **kwargs):
         """
         Validate the hash and size of the downloaded data against the expected values.
-        """
-
-    @abstractmethod
-    def save_file(self, data, target, filename, filesize):
-        """
-        Save the downloaded data to disk.
         """
 
 
@@ -101,7 +94,6 @@ class DownloadWorker(BaseDownloader):
     """
     Concrete implementation of BaseDownloader for handling download jobs.
     """
-    __DOWNLOAD_OPTIONS = ['fs', 's3']
 
     def __init__(self,
                  queue: BaseQueue,
@@ -116,22 +108,7 @@ class DownloadWorker(BaseDownloader):
         self.http = urllib3.PoolManager(timeout=timeout)
         self.queue = queue
         self.status = "ready"
-        self.download_options = self.__validate_download_options(download_options)
-
-    def __validate_download_options(self, options: dict):
-        """
-        Validate the download options.
-
-        :param options: The download options to validate.
-        :raises ValueError: If any required option is missing or invalid.
-        """
-        d_ops: List[storage.Storage] = []
-        for key in self.__DOWNLOAD_OPTIONS:
-            if key not in options:
-                raise ValueError(f"Missing required download option: {key}")
-            d_ops.append(getattr(storage, key.upper())(**options[key]))
-
-        return d_ops
+        self.download_options = [getattr(storage, key.upper())(**download_options[key]) for key in download_options]
 
     def start(self) -> None:
         """
@@ -148,6 +125,7 @@ class DownloadWorker(BaseDownloader):
                 self.process_job(job)
             except Exception as e:
                 LOGGER.error(e)
+                raise e
 
             self.status = "ready"
             self.queue.task_done()
@@ -160,7 +138,10 @@ class DownloadWorker(BaseDownloader):
         """
 
         expected_hash, hash_function = self.get_hash_info(job)
-        expected_size = job.get('payload', {}).get('content', {}).get('size')
+        # FIXME BUG payload has no content
+        payload = job.get('payload', {})
+        expected_size = (payload.get('content', {}).get('size') or
+                         payload.get('properties', {}).get('content', {}).get('size'))
 
         # Get the download url, update status, and file type from the job links
         _url, update, media_type = self.get_download_url(job)
@@ -169,35 +150,22 @@ class DownloadWorker(BaseDownloader):
             LOGGER.warning("No download link found in job %s", job)
             return
 
-        # Map media type to file extension
-        file_type = MEDIA_TYPE_MAP.get(media_type, 'bin')
-
-        # Global caches can set whatever filename they want, we need to use
-        # the data_id for uniqueness. However, this can be unwieldy, hence use
-        # the hash of data_id
-        # TODO use data_id to store on Minio S3
-        data_id = job.get('payload', {}).get('properties', {}).get('data_id')
-        filename, _ = self.extract_filename(_url)
-        filename = f"{filename}.{file_type}"
-        # loop through storage adapters to assign full download location
-        for storage_obj in self.download_options:
-            if hasattr(storage_obj, "base_path"):
-                storage_obj.base_path = job.get("target", ".")
-            elif hasattr(storage_obj, "s3_path"):
-                storage_obj.s3_path = data_id
+        # Start timer of download time to be logged later
+        # TODO complete download timeit
+        download_start = dt.now()
 
         # Get information needed for download metric labels
         topic, centre_id = self.get_topic_and_centre(job)
-
-        # Start timer of download time to be logged later
-        download_start = dt.now()
-
         # Download the file
         try:
             response = self.http.request('GET', _url)
             # Get the file size in KB
-            filesize = len(response.data)
-            # Use the hash function to determine whether to save the data
+            file_size = len(response.data)
+            # Global caches can set whatever file_name they want, we need to use
+            # the data_id for uniqueness. However, this can be unwieldy, hence use
+            #  the hash function to determine whether to save the data
+            data_id = job.get('payload', {}).get('properties', {}).get('data_id')
+
             if not response or not self.validate_data(response.data,
                                                       expected_hash,
                                                       hash_function,
@@ -212,33 +180,28 @@ class DownloadWorker(BaseDownloader):
             FAILED_DOWNLOADS_BROKER.labels(topic=topic, centre_id=centre_id).inc(1)
             return
 
-        file_type_label = file_type if file_type in ['bufr', 'grib', 'json', 'xml', 'png'] else 'other'
+        # Map media type to file extension
+        file_type = MEDIA_TYPE_MAP.get(media_type, 'bin')
+        file_name, _ = self.extract_file_name(_url)
         # Save using Multiple storage adapters
         for storage_obj in self.download_options:
             result = storage_obj.save(
                 response.data,
-                filename,
-                filesize,
+                storage.StorageKeyType[storage_obj.__name__].build_key(job=job, file_name=f"{file_name}.{file_type}"),
+                file_size,
                 "application/octet-stream")
             if result:
-                DOWNLOADED_BYTES.labels(
-                    target=storage_obj.__name__,
-                    topic=topic,
-                    centre_id=centre_id,
-                    file_type=file_type_label).inc(filesize)
-                DOWNLOADED_FILES.labels(
-                    target=storage_obj.__name__,
-                    topic=topic,
-                    centre_id=centre_id,
-                    file_type=file_type_label).inc(1)
+                # Get File label
+                file_type_label = file_type if file_type in ['bufr', 'grib', 'json', 'xml', 'png'] else 'other'
+                DOWNLOADED_BYTES.labels(target=storage_obj.__name__, topic=topic, centre_id=centre_id,
+                                        file_type=file_type_label).inc(file_size)
+                DOWNLOADED_FILES.labels(target=storage_obj.__name__, topic=topic, centre_id=centre_id,
+                                        file_type=file_type_label).inc(1)
             else:
-                FAILED_DOWNLOADS.labels(
-                    target=storage_obj.__name__,
-                    topic=topic,
-                    centre_id=centre_id).inc(1)
+                FAILED_DOWNLOADS.labels(target=storage_obj.__name__, topic=topic, centre_id=centre_id).inc(1)
 
         download_time = (dt.now() - download_start).total_seconds()
-        LOGGER.info("Downloaded %s of size %d bytes in %.2f seconds", filename, filesize, download_time)
+        LOGGER.info("Downloaded %s of size %d bytes in %.2f seconds", file_name, file_size, download_time)
 
     def get_topic_and_centre(self, job) -> tuple:
         """
@@ -257,11 +220,13 @@ class DownloadWorker(BaseDownloader):
         :param job: The job to extract information from.
         :returns: A tuple containing the expected hash and hash function.
         """
-        expected_hash = job.get('payload', {}).get('properties', {}).get('integrity', {}).get('hash')
+        # FIXME BUG integrity has no hash (value instead)
+        integrity = job.get('payload', {}).get('properties', {}).get('integrity', {})
+        expected_hash = integrity.get('hash') or integrity.get('value')
         hash_method = job.get('payload', {}).get('properties', {}).get('integrity', {}).get('method')
         # Check if hash method is known using our enumeration of hash methods
         try:
-            method = VerificationMethods[hash_method].value
+            method = VerificationMethods[hash_method.upper()].value
             hash_function = hashlib.new(method)
         except KeyError:
             LOGGER.warning("Unknown hash method: %s", hash_method)
@@ -288,16 +253,18 @@ class DownloadWorker(BaseDownloader):
 
         return _url, update, media_type
 
-    def extract_filename(self, _url) -> tuple:
+    def extract_file_name(self, _url) -> tuple:
         """
-        Extract the filename and extension from the download link.
+        Extract the file_name and extension from the download link.
 
         :param _url: The download url.
-        :returns: A tuple containing the filename and extension.
+        :returns: A tuple containing the file_name and extension.
         """
         path = urlsplit(_url).path
-        filename = os.path.basename(path)
-        return os.path.splitext(filename)
+        file_name = os.path.basename(path)
+        # FIXME is it a BUG ?? some filename has naming like this below, do we keep it this way ?
+        #  eaa5cc04-f9c1-4493-afda-fa096eafdb12__WIGOS_0-20000-0-60693_20241018T210000.bufr4
+        return os.path.splitext(file_name)
 
     def validate_data(
             self,
@@ -317,24 +284,12 @@ class DownloadWorker(BaseDownloader):
         """
         if None in (expected_hash, hash_function):
             return True
-        hash_value = base64.b64encode(hash_function(data).digest()).decode()
+        # TODO BUG TypeError: '_hashlib.HASH' object is not callable in
+        #  hash_value = base64.b64encode(hash_function(data).digest()).decode(), hash_function is an instance and
+        #  should use its update method
+        hash_function.update(data)
+        hash_value = base64.b64encode(hash_function.digest()).decode()
         if not (hash_value == expected_hash and len(data) == expected_size):
             LOGGER.warning("Download %s failed verification, discarding", kwargs.get("data_id"))
             return False
         return True
-
-    def save_file(self, data, target, filename, filesize) -> None:
-        """
-        Save the downloaded data to disk.
-
-        :param data: The downloaded data.
-        :param target: The target path to save the data.
-        :param filename: The name of the file.
-        :param filesize: The size of the file.
-        :param download_start: The start time of the download.
-        """
-        try:
-            target.write_bytes(data)
-        except Exception as e:
-            LOGGER.error("Error saving to disk: %s", target)
-            LOGGER.error(e)

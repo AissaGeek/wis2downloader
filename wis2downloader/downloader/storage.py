@@ -3,7 +3,9 @@ This module provides an abstract base class for storage and a concrete
 implementation for S3 storage.
 """
 
+import enum
 import io
+import re
 import shutil
 from abc import abstractmethod, ABC
 from datetime import datetime as dt
@@ -15,15 +17,9 @@ from urllib3.exceptions import HTTPError
 
 from wis2downloader.log import LOGGER
 
-__all__ = ['S3', 'FS']
+__all__ = ['S3', 'FS', 'StorageKeyType', 'ALL_STORAGES']
 
-
-def get_date_now() -> str:
-    """
-    Returns today's date in the format yyyy/mm/dd.
-    """
-    today = dt.now()
-    return f'{today.strftime("%Y")}/{today.strftime("%m")}/{today.strftime("%d")}'
+ALL_STORAGES = ['S3', 'FS']
 
 
 class Storage(ABC):
@@ -32,40 +28,27 @@ class Storage(ABC):
     """
 
     @abstractmethod
-    def exists(self, filename: Path) -> bool:
+    def exists(self, key: Path) -> bool:
         """
         Verify whether data already exists
 
-        :param filename: `Path` of storage object/file
+        :param key: `Path` of storage object/file
 
         :returns: `bool` of whether the filepath exists in storage
         """
 
     @abstractmethod
-    def save(self, data, filename, filesize, content_type) -> bool:
+    def save(self, data, key, file_size, content_type) -> bool:
         """
         Save data to storage
         :param data: `bytes` of data
-        :param filename: `str` of filename
-        :param filesize: `int` of filesize (default is -1)
+        :param key: `str` of key
+        :param file_size: `int` of file_size (default is -1)
         :param content_type: `str` of content type (default is `application/octet-stream`)
 
         :returns: `bool` of save result
         """
 
-
-# def _metric_save(func):
-#     """
-#     Decorator to increment metrics for successful saves
-#     """
-#     def decorator(*args, **kwargs):
-#         def wrapper(target):
-#             result = func(*args, **kwargs)
-#             if result:
-#                 DOWNLOADED_FILES.labels(target=args[0].target, topic=args[0].topic, centre_id=args[0].centre_id, file_type=args[0].file_type).inc(1)
-#                 DOWNLOADED_BYTES.labels(target=args[0].target, topic=args[0].topic, centre_id=args[0].centre_id, file_type=args[0].file_type).inc(args[1])
-#             return result
-#     return wrapper
 
 class S3(Storage):
     """
@@ -89,35 +72,26 @@ class S3(Storage):
             )
             self._client = minio.Minio(**kwargs, http_client=http_client, secure=False)
             self._initialized = True
-            self._s3_path = ""
 
-    @property
-    def s3_path(self) -> str:
-        return self._s3_path
-
-    @s3_path.setter
-    def s3_path(self, path: str):
-        self._s3_path += path.strip()
-
-    def exists(self, filename: str) -> bool:
-        self._client.stat_object(self._s3_bucket, str(filename))
+    def exists(self, key: str) -> bool:
+        self._client.stat_object(self._s3_bucket, str(key))
         return True
 
-    def save(self, data: bytes, filename: str,
-             _: int = -1, content_type: str = 'application/octet-stream') -> bool:
+    def save(self, data: bytes, key: str = '',
+             file_size: int = -1, content_type: str = 'application/octet-stream') -> bool:
         try:
-            if self.exists(filename):
-                LOGGER.warning('Object already exists: %s', filename)
+            if self.exists(key):
+                LOGGER.warning('Object already exists: %s', key)
                 return False
             self._client.put_object(
                 self._s3_bucket,
-                str(filename),
+                key,
                 io.BytesIO(data),
                 length=-1,
                 part_size=10 * 1024 * 1024,
                 content_type=content_type
             )
-            LOGGER.info('Data saved to %s', filename)
+            LOGGER.info('Data saved to %s', key)
             return True
         except minio.error.S3Error as err:
             LOGGER.error("Error saving file: %s", err)
@@ -143,27 +117,22 @@ class FS(Storage):
 
     def __init__(self, **kwargs):
         if not hasattr(self, '_initialized'):
-            self._original_path: str = kwargs['basedir'].strip()
+            self._base_path: str = kwargs['basedir'].strip()
             self.min_free_space = self.min_free_space * (1024 ** 3)  # GBytes to Bytes
             self._initialized = True
-            self._base_path = ""
 
-    @property
-    def base_path(self) -> str:
-        return self._base_path
+    def exists(self, key: Path) -> bool:
+        return key.exists()
 
-    @base_path.setter
-    def base_path(self, path: str):
-        self._base_path = self._original_path
-        self._base_path += f"/{get_date_now()}/{path.strip()}"
-
-    def exists(self, filename: Path) -> bool:
-        return filename.exists()
-
-    def save(self, data: bytes, filename: str, filesize: int = -1, _: str = '') -> bool:
+    def save(
+            self,
+            data: bytes,
+            key: str,
+            file_size: int = -1,
+            _: str = '') -> bool:
         # TODO CONFIG['min_free_space']
         try:
-            file_path = Path(self._base_path) / filename
+            file_path = Path(self._base_path) / key
             file_path.parent.mkdir(parents=True, exist_ok=True)
             if self.exists(file_path):
                 LOGGER.warning('File already exists: %s', file_path)
@@ -172,7 +141,7 @@ class FS(Storage):
                 free_space = self.get_free_space()
                 if free_space < self.min_free_space:
                     LOGGER.warning("Too little free space, %d < %d, file %s not saved",
-                                   free_space - filesize, self.min_free_space, filename)
+                                   free_space - file_size, self.min_free_space, key)
                     return False
             with open(file_path, 'wb') as file:
                 file.write(data)
@@ -190,3 +159,52 @@ class FS(Storage):
         """
         _, _, free = shutil.disk_usage(self._base_path)
         return free
+
+
+def _extract_relative_topic(topic: str) -> str:
+    """
+    Extract relative topic from full global broker topic
+    :param topic:
+    :return:
+    """
+    pattern = r'a/wis2/(.*)'
+    match = re.search(pattern, topic)
+    if match:
+        return match.group(1)
+    return ''
+
+
+def get_date_now() -> str:
+    """
+    Returns today's date in the format yyyy/mm/dd.
+    """
+    today = dt.now()
+    return f'{today.strftime("%Y")}/{today.strftime("%m")}/{today.strftime("%d")}'
+
+
+class StorageKeyType(enum.Enum):
+    """
+    Enum for different types of storage backends.
+    """
+    S3 = "S3"
+    FS = "FS"
+
+    def build_key(self, job: dict, file_name: str) -> Path:
+        """
+        Build a storage key based on the storage type.
+
+        :param job: information to build base key oath
+        :param file_name: The file_name with extension .
+        :returns: A string representing the storage key.
+        """
+
+        if self.name == 'S3':
+            base_key_s3 = _extract_relative_topic(job.get("topic"))
+            return Path(base_key_s3) / file_name
+        elif self.name == 'FS':
+            base_key_fs = Path(get_date_now()) / job.get("target", ".")
+            return base_key_fs / file_name
+        else:
+            raise KeyError(
+                "No such storage"
+            )
