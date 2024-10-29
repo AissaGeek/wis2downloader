@@ -1,41 +1,27 @@
 [build-system]
-requires  = ["setuptools", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
 
-[tool.setuptools.packages.find]
-exclude = ["docker"]
-
-[project]
+[tool.poetry]
 name = "wis2downloader"
-authors = [
-    {name = "Rory Burke"}
-]
-maintainers = [
-    {name = "Rory Burke"},
-    {name = "David I. Berry", email = "dberry@wmo.int"}
-]
+version = "0.1.0"
 description = "Python package to manage subscriptions and downloads from the WIS2.0"
+authors = ["Rory Burke"]
+maintainers = ["Rory Burke", "David I. Berry <dberry@wmo.int>"]
 readme = "README.md"
-requires-python = ">=3.8"
 keywords = ["WIS2.0", "MQTT", "subscribe", "download"]
-license = {file = "LICENSE"}
-dependencies = [
-    "click",
-    "certifi>=2024.2.2",
-    "flask>=3.0.3",
-    "flask-cors>=4.0.0",
-    "paho-mqtt>=2.0.0 ",
-    "prometheus_client>=0.20.0",
-    "requests",
-    "urllib3>=2.2.1",
-    "pywis-topics>=0.3.2",
-    "pyyaml"
-]
-dynamic = ["version"]
+homepage = "https://mfi.fr"
 
-[project.scripts]
+[tool.poetry.dependencies]
+python = ">=3.9"
+certifi = ">=2024.2.2"
+flask = ">=3.0.3"
+flask-cors = ">=4.0.0"
+paho-mqtt = ">=2.0.0"
+prometheus_client = ">=0.20.0"
+pywis-topics = ">=0.3.2"
+tenacity = "^9.0.0"
+minio = "^7.2.10"
 
+[tool.poetry.scripts]
 wis2downloader = "wis2downloader:cli.cli"
-
-[tool.setuptools.dynamic]
-version = {attr = "wis2downloader.__version__"}
