@@ -12,6 +12,8 @@ from datetime import datetime as dt
 from pathlib import Path
 
 import minio
+from minio import S3Error
+from tenacity import retry, stop_after_attempt, wait_fixed, before_log, after_log
 from urllib3 import PoolManager
 from urllib3.exceptions import HTTPError
 
@@ -70,11 +72,34 @@ class S3(Storage):
                 retries=0,
                 timeout=5
             )
-            self._client = minio.Minio(**kwargs, http_client=http_client, secure=False)
+            self._client = minio.Minio(http_client=http_client, secure=False, **kwargs)
             self._initialized = True
 
+        # Check connection to Minio
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_fixed(1),
+            before=before_log(LOGGER, 20),
+            after=after_log(LOGGER, 20),
+        )
+        def _check_connection():
+            try:
+                all_buckets = self._client.list_buckets()
+                LOGGER.info(
+                    "Connection to Minio established. Buckets available are : %s ", all_buckets)
+            except Exception as e:
+                LOGGER.error("Cannot establish connection to Minio. REASON: %s", str(e))
+                raise e
+
+        _check_connection()
+
     def exists(self, key: str) -> bool:
-        self._client.stat_object(self._s3_bucket, str(key))
+        try:
+            self._client.stat_object(self._s3_bucket, key)
+        except S3Error as e:
+            if "NoSuchKey" in e.code:
+                return False
+            raise e
         return True
 
     def save(self, data: bytes, key: str = '',
@@ -91,13 +116,13 @@ class S3(Storage):
                 part_size=10 * 1024 * 1024,
                 content_type=content_type
             )
-            LOGGER.info('Data saved to %s', key)
+            LOGGER.info('Data saved on S3 to %s', key)
             return True
         except minio.error.S3Error as err:
-            LOGGER.error("Error saving file: %s", err)
+            LOGGER.error("Error saving file on S3: %s", err)
             return False
         except HTTPError as err:
-            LOGGER.error("Error saving file: %s", err)
+            LOGGER.error("Error saving file on S3: %s", err)
             return False
 
 
@@ -145,10 +170,10 @@ class FS(Storage):
                     return False
             with open(file_path, 'wb') as file:
                 file.write(data)
-            LOGGER.info('Data saved to %s', file_path)
+            LOGGER.info('Data saved on FS to %s', file_path)
             return True
         except (OSError, IOError) as err:
-            LOGGER.error("Error saving file: %s", err)
+            LOGGER.error("Error saving file on FS: %s", err)
             return False
 
     def get_free_space(self):
@@ -189,7 +214,7 @@ class StorageKeyType(enum.Enum):
     S3 = "S3"
     FS = "FS"
 
-    def build_key(self, job: dict, file_name: str) -> Path:
+    def build_key(self, job: dict, file_name: str) -> str:
         """
         Build a storage key based on the storage type.
 
@@ -200,10 +225,10 @@ class StorageKeyType(enum.Enum):
 
         if self.name == 'S3':
             base_key_s3 = _extract_relative_topic(job.get("topic"))
-            return Path(base_key_s3) / file_name
+            return f"{base_key_s3}/{file_name}"
         elif self.name == 'FS':
             base_key_fs = Path(get_date_now()) / job.get("target", ".")
-            return base_key_fs / file_name
+            return str(base_key_fs / file_name)
         else:
             raise KeyError(
                 "No such storage"
