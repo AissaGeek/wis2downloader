@@ -1,0 +1,39 @@
+x-minio-user-password: &minio-env
+  MINIO_ROOT_USER: admin
+  MINIO_ROOT_PASSWORD: admin1234
+  MINIO_HOST: localhost
+
+services:
+  minio:
+      image: minio/minio:RELEASE.2024-02-13T15-35-11Z
+      command: >
+        server --console-address :9001 /data
+         --ftp="address=:8021"
+         --ftp="passive-port-range=30000-40000"
+      network_mode: host
+      environment:
+        <<: *minio-env
+      volumes:
+        - minio_data:/data
+      healthcheck:
+        test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
+        interval: 1m30s
+        timeout: 20s
+        retries: 3
+        start_period: 3m
+
+  create-buckets:
+    image: minio/mc
+    environment:
+      <<: *minio-env
+    volumes:
+      - ./config/init_minio.sh:/scripts/init_minio.sh
+      - ./config/lifecycle_deletion.json.template:/scripts/lifecycle_deletion.json.template:ro
+    network_mode: host
+    restart: on-failure
+    depends_on:
+      - minio
+    entrypoint: /bin/bash /scripts/init_minio.sh
+
+volumes:
+  minio_data:
